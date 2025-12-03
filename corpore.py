@@ -1,335 +1,382 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime
+from datetime import datetime
 import os
 import hashlib
 import base64
 import shutil
 
-# --- Configuração da Página ---
+# --- Configuração da Página (Deve ser a primeira linha) ---
 st.set_page_config(
-    page_title="Portal Colaborador - Clínica Corpore",
+    page_title="Portal Corpore",
     page_icon="🏥",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- CONFIGURAÇÃO DE SEGURANÇA E ARQUIVOS ---
+# --- CONFIGURAÇÕES GLOBAIS ---
 FILE_DB = 'profissionais_db_secure.csv'
-BASE_FILES_DIR = "user_files" 
-
-# Campos sensíveis
+BASE_FILES_DIR = "corpore_docs"
 SENSITIVE_COLUMNS = ['CPF', 'Mãe', 'Email', 'Telefone', 'Pix', 'Banco']
 
-# --- FUNÇÕES DE UTILIDADE (Files, Auth, Obfuscation) ---
+# CSS Personalizado para visual profissional
+st.markdown("""
+    <style>
+    .main-header {font-size: 2.5rem; color: #004E98; font-weight: 700;}
+    .sub-header {font-size: 1.5rem; color: #3A6EA5; margin-top: 1rem;}
+    .card {background-color: #f9f9f9; padding: 1.5rem; border-radius: 10px; border-left: 5px solid #004E98; margin-bottom: 1rem;}
+    .success-box {padding: 1rem; background-color: #d4edda; color: #155724; border-radius: 5px;}
+    </style>
+""", unsafe_allow_html=True)
 
-def ensure_directories(cpf):
-    """Cria a estrutura de pastas para um usuário específico se não existir."""
-    admin_to_user = os.path.join(BASE_FILES_DIR, cpf, "recebidos_gestao")
-    user_to_admin = os.path.join(BASE_FILES_DIR, cpf, "enviados_usuario")
+# --- FUNÇÕES CORE (Segurança, Arquivos, DB) ---
+
+def init_environment():
+    """Garante que pastas e arquivos essenciais existam."""
+    if not os.path.exists(BASE_FILES_DIR):
+        os.makedirs(BASE_FILES_DIR)
+
+def ensure_user_dirs(cpf):
+    """Cria pastas isoladas para cada usuário."""
+    # Estrutura: corpore_docs/12345678900/recebidos e .../enviados
+    user_root = os.path.join(BASE_FILES_DIR, str(cpf))
+    inbox = os.path.join(user_root, "recebidos_gestao") # Admin -> Usuário
+    outbox = os.path.join(user_root, "enviados_usuario") # Usuário -> Admin
     
-    os.makedirs(admin_to_user, exist_ok=True)
-    os.makedirs(user_to_admin, exist_ok=True)
-    return admin_to_user, user_to_admin
+    os.makedirs(inbox, exist_ok=True)
+    os.makedirs(outbox, exist_ok=True)
+    return inbox, outbox
 
-def save_uploaded_file(uploaded_file, directory):
-    """Salva um arquivo enviado via Streamlit no diretório local."""
-    if uploaded_file is not None:
-        file_path = os.path.join(directory, uploaded_file.name)
+def save_uploaded_file(uploaded_file, target_folder):
+    """Salva arquivo com tratamento de erros."""
+    try:
+        if not os.path.exists(target_folder):
+            os.makedirs(target_folder)
+            
+        file_path = os.path.join(target_folder, uploaded_file.name)
         with open(file_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
         return True
-    return False
+    except Exception as e:
+        st.error(f"Erro ao salvar arquivo: {e}")
+        return False
 
-def list_files_in_dir(directory):
+def get_files(directory):
     if os.path.exists(directory):
-        return [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
+        return [f for f in os.listdir(directory) if not f.startswith('.')]
     return []
 
-# --- MUDANÇA: Substituindo Criptografia Pesada por Ofuscação Base64 (Standard Lib) ---
-# Isso resolve o erro ModuleNotFoundError pois base64 vem com o Python.
+# --- SEGURANÇA ---
+def encrypt(text):
+    """Ofuscação simples para persistência (Base64)."""
+    return base64.b64encode(str(text).encode()).decode() if text else ""
 
-def encrypt_data(text):
-    """Ofusca o texto usando Base64 (Simples, mas sem dependência externa)."""
-    if not isinstance(text, str): text = str(text)
+def decrypt(text):
+    """Reverte ofuscação."""
     try:
-        return base64.b64encode(text.encode("utf-8")).decode("utf-8")
-    except Exception:
+        return base64.b64decode(str(text).encode()).decode() if text else ""
+    except:
         return text
 
-def decrypt_data(text):
-    """Reverte a ofuscação Base64."""
-    try:
-        return base64.b64decode(text.encode("utf-8")).decode("utf-8")
-    except Exception:
-        return text
+def hash_pass(password):
+    return hashlib.sha256(str(password).encode()).hexdigest()
 
-def hash_password(password):
-    """Hash SHA-256 para senhas (Seguro e Standard Lib)."""
-    return hashlib.sha256(password.encode()).hexdigest()
+def verify_pass(stored, provided):
+    return stored == hash_pass(provided)
 
-def verify_password(stored_hash, provided_password):
-    return stored_hash == hash_password(provided_password)
-
-# --- FUNÇÕES DE BANCO DE DADOS ---
-
-def load_data_secure():
+# --- BANCO DE DADOS ---
+def load_db():
     if os.path.exists(FILE_DB):
-        df = pd.read_csv(FILE_DB)
-        # Desofusca dados para uso interno
+        df = pd.read_csv(FILE_DB, dtype=str) # Lê tudo como string para evitar erros de CPF
+        # Desofusca para uso na memória
         for col in SENSITIVE_COLUMNS:
             if col in df.columns:
-                df[col] = df[col].apply(lambda x: decrypt_data(x) if pd.notnull(x) else x)
+                df[col] = df[col].apply(lambda x: decrypt(x))
         return df
-    return pd.DataFrame(columns=['CPF', 'Senha', 'Nome'])
+    return pd.DataFrame(columns=['CPF', 'Senha', 'Nome', 'Role', 'Unidade', 'Email', 'Telefone', 'Pix', 'Banco', 'Disponibilidade'])
 
-def save_professional_secure(data, is_update=False):
-    data_encrypted = data.copy()
+def save_user(user_data, update=False):
+    """Salva ou atualiza um usuário."""
+    df = load_db()
     
-    # Ofusca campos sensíveis
+    # Prepara dados para salvar (criptografar)
+    data_to_save = user_data.copy()
     for col in SENSITIVE_COLUMNS:
-        if col in data_encrypted and data_encrypted[col]:
-             data_encrypted[col] = encrypt_data(data_encrypted[col])
-    
-    df_new = pd.DataFrame([data_encrypted])
-    
-    if not os.path.exists(FILE_DB):
-        df_new.to_csv(FILE_DB, index=False)
-    else:
-        # Carrega dados atuais (desofuscados para achar o registro)
-        df_curr = load_data_secure()
-        
-        if is_update:
-            # Atualiza registro existente
-            idx = df_curr[df_curr['CPF'] == data['CPF']].index
-            if not idx.empty:
-                for key, value in data.items():
-                    df_curr.at[idx[0], key] = value
-            else:
-                df_curr = pd.concat([df_curr, pd.DataFrame([data])], ignore_index=True)
+        if col in data_to_save:
+            data_to_save[col] = encrypt(data_to_save[col])
             
-            # Re-ofusca tudo para salvar
-            for col in SENSITIVE_COLUMNS:
-                if col in df_curr.columns:
-                    df_curr[col] = df_curr[col].apply(lambda x: encrypt_data(x) if pd.notnull(x) else x)
-            df_curr.to_csv(FILE_DB, index=False)
+    # Hash da senha se for novo cadastro ou alteração de senha
+    if 'Senha' in data_to_save and len(data_to_save['Senha']) < 50: # Assume que se for curto, não é hash
+        data_to_save['Senha'] = hash_pass(data_to_save['Senha'])
+
+    df_new_row = pd.DataFrame([data_to_save])
+
+    if update:
+        # Remove antigo e adiciona novo (pelo CPF que é a chave)
+        # Nota: CPF criptografado muda, então buscamos pelo CPF decriptado antes
+        df = df[df['CPF'] != user_data['CPF']] # Remove user atual da memória decriptada
+        
+        # Re-criptografa todo o DF da memória para salvar
+        for col in SENSITIVE_COLUMNS:
+            if col in df.columns:
+                df[col] = df[col].apply(encrypt)
+        
+        # Concatena o novo (já criptografado)
+        df_final = pd.concat([df, df_new_row], ignore_index=True)
+    else:
+        # Modo Append: Carrega o arquivo bruto para não precisar re-criptografar tudo
+        if os.path.exists(FILE_DB):
+            df_raw = pd.read_csv(FILE_DB, dtype=str)
+            df_final = pd.concat([df_raw, df_new_row], ignore_index=True)
         else:
-            # Adiciona novo registro ao arquivo existente (lendo o arquivo bruto para ser mais rápido)
-            df_old_raw = pd.read_csv(FILE_DB)
-            df_combined = pd.concat([df_old_raw, df_new], ignore_index=True)
-            df_combined.to_csv(FILE_DB, index=False)
+            df_final = df_new_row
+            
+    df_final.to_csv(FILE_DB, index=False)
 
-# --- SISTEMA DE SESSÃO ---
-if 'user' not in st.session_state:
-    st.session_state['user'] = None
-if 'role' not in st.session_state:
-    st.session_state['role'] = None 
-if 'menu_option' not in st.session_state:
-    st.session_state['menu_option'] = None
+# --- INTERFACE: TELAS ---
 
-# --- SIDEBAR: LOGIN & MENU ---
-st.sidebar.image("https://img.icons8.com/ios/100/228BE6/hospital-3.png", width=80) 
-st.sidebar.title("Portal Corpore")
-
-# Área de Login na Sidebar
-if st.session_state['user'] is None:
-    st.sidebar.header("Identifique-se")
-    login_cpf = st.sidebar.text_input("CPF (Apenas números)", placeholder="12345678900")
-    login_senha = st.sidebar.text_input("Senha", type="password")
+def screen_setup_admin():
+    st.markdown("<h1 class='main-header'>🚀 Configuração Inicial</h1>", unsafe_allow_html=True)
+    st.info("O sistema detectou que não há usuários cadastrados. Crie a conta do ADMINISTRADOR MASTER.")
     
-    col_l1, col_l2 = st.sidebar.columns(2)
-    if col_l1.button("Entrar"):
-        if login_cpf == "admin" and login_senha == "admin123":
-            st.session_state['user'] = {"Nome": "Administrador", "CPF": "admin"}
-            st.session_state['role'] = "admin"
-            st.rerun()
-        else:
-            df = load_data_secure()
-            if not df.empty:
-                user_row = df[df['CPF'] == login_cpf]
-                if not user_row.empty:
-                    stored_pass = user_row.iloc[0]['Senha']
-                    if verify_password(stored_pass, login_senha):
-                        st.session_state['user'] = user_row.iloc[0].to_dict()
-                        st.session_state['role'] = "user"
-                        st.success("Login realizado!")
+    with st.form("setup_form"):
+        col1, col2 = st.columns(2)
+        nome = col1.text_input("Nome do Gestor")
+        cpf = col2.text_input("CPF (Login)", max_chars=11)
+        senha = col1.text_input("Senha", type="password")
+        senha_conf = col2.text_input("Confirmar Senha", type="password")
+        
+        if st.form_submit_button("Inicializar Sistema"):
+            if senha != senha_conf:
+                st.error("Senhas não conferem.")
+            elif not cpf or not nome:
+                st.error("Preencha todos os campos.")
+            else:
+                admin_data = {
+                    "Nome": nome, "CPF": cpf, "Senha": senha, 
+                    "Role": "admin", "Unidade": "Matriz",
+                    "Data Cadastro": datetime.now().strftime("%Y-%m-%d")
+                }
+                save_user(admin_data)
+                ensure_user_dirs(cpf)
+                st.success("Administrador criado! Atualize a página para fazer login.")
+                st.balloons()
+
+def screen_login():
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        st.markdown("<div style='text-align: center; margin-top: 50px;'>", unsafe_allow_html=True)
+        st.image("https://img.icons8.com/ios/100/228BE6/hospital-3.png", width=80)
+        st.markdown("<h2 style='color: #004E98;'>Portal Corpore</h2></div>", unsafe_allow_html=True)
+        
+        with st.form("login_form"):
+            cpf = st.text_input("CPF / Usuário", placeholder="Digite apenas números")
+            senha = st.text_input("Senha", type="password")
+            submitted = st.form_submit_button("Entrar no Portal", use_container_width=True)
+            
+            if submitted:
+                df = load_db()
+                user = df[df['CPF'] == cpf]
+                
+                if not user.empty:
+                    stored_pass = user.iloc[0]['Senha']
+                    # Verifica hash (ou texto puro de legado)
+                    if stored_pass == hash_pass(senha) or stored_pass == senha:
+                        st.session_state['user'] = user.iloc[0].to_dict()
+                        st.success("Login efetuado com sucesso!")
                         st.rerun()
                     else:
-                        st.sidebar.error("Senha incorreta.")
+                        st.error("Senha incorreta.")
                 else:
-                    st.sidebar.error("Usuário não encontrado.")
-            else:
-                 st.sidebar.error("Base de dados vazia.")
-    
-    if col_l2.button("Cadastrar"):
-        st.session_state['menu_option'] = "cadastro_novo"
+                    st.error("Usuário não encontrado.")
 
-else:
-    st.sidebar.success(f"Olá, {st.session_state['user']['Nome']}")
-    if st.sidebar.button("Sair / Logout"):
+def screen_admin_dashboard(user):
+    st.markdown(f"<h1 class='main-header'>Painel de Gestão</h1>", unsafe_allow_html=True)
+    st.write(f"Logado como: **{user['Nome']}** (Administrador)")
+    
+    tabs = st.tabs(["📊 Visão Geral", "👥 Gestão de Profissionais", "📤 Central de Arquivos", "📅 Calendário"])
+    
+    df = load_db()
+    
+    with tabs[0]: # Dashboard
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Profissionais Cadastrados", len(df))
+        col2.metric("Unidades Ativas", df['Unidade'].nunique())
+        col3.metric("Cadastros Hoje", len(df[df['Data Cadastro'] == datetime.now().strftime("%Y-%m-%d")]) if 'Data Cadastro' in df else 0)
+        
+        st.markdown("---")
+        st.subheader("Profissionais por Unidade")
+        st.bar_chart(df['Unidade'].value_counts())
+
+    with tabs[1]: # Gestão de Pessoas (Cadastro)
+        c1, c2 = st.columns([1, 2])
+        
+        with c1:
+            st.markdown("### ➕ Novo Profissional")
+            with st.form("new_user_admin"):
+                new_nome = st.text_input("Nome Completo")
+                new_cpf = st.text_input("CPF (Apenas números)", max_chars=11)
+                new_pass = st.text_input("Senha Temporária", type="password")
+                new_unit = st.selectbox("Unidade", ["Unidade 1 - Centro", "Unidade 2 - Zona Sul"])
+                
+                if st.form_submit_button("Cadastrar Profissional"):
+                    if new_cpf in df['CPF'].values:
+                        st.error("CPF já existe no sistema.")
+                    else:
+                        new_data = {
+                            "Nome": new_nome, "CPF": new_cpf, "Senha": new_pass,
+                            "Role": "user", "Unidade": new_unit,
+                            "Data Cadastro": datetime.now().strftime("%Y-%m-%d")
+                        }
+                        save_user(new_data)
+                        ensure_user_dirs(new_cpf)
+                        st.success(f"Profissional {new_nome} cadastrado!")
+                        st.rerun()
+        
+        with c2:
+            st.markdown("### 📋 Lista de Profissionais")
+            # Mostra tabela simplificada
+            display_cols = ['Nome', 'CPF', 'Unidade', 'Telefone', 'Email']
+            st.dataframe(df[display_cols], use_container_width=True)
+
+    with tabs[2]: # Arquivos
+        st.subheader("Envio de Relatórios e Holerites")
+        
+        # Selecionar Destinatário
+        users_list = df[df['Role'] != 'admin']
+        if not users_list.empty:
+            destinatario = st.selectbox("Selecione o Profissional", users_list['Nome'] + " - " + users_list['CPF'])
+            cpf_dest = destinatario.split(" - ")[-1]
+            
+            # Área de Upload
+            file = st.file_uploader("Arraste o documento aqui (PDF, Excel, Imagem)", type=['pdf', 'xlsx', 'jpg', 'png'])
+            
+            if file and st.button("Enviar Documento"):
+                path_dest, _ = ensure_user_dirs(cpf_dest)
+                if save_uploaded_file(file, path_dest):
+                    st.success(f"Arquivo enviado para {destinatario} com sucesso!")
+            
+            st.markdown("---")
+            st.markdown(f"**Arquivos enviados pelo usuário {cpf_dest}:**")
+            _, path_from_user = ensure_user_dirs(cpf_dest)
+            arquivos_user = get_files(path_from_user)
+            
+            if arquivos_user:
+                for arq in arquivos_user:
+                    col_f1, col_f2 = st.columns([4, 1])
+                    col_f1.text(f"📎 {arq}")
+                    with open(os.path.join(path_from_user, arq), "rb") as f:
+                        col_f2.download_button("Baixar", f, file_name=f"RECEBIDO_{cpf_dest}_{arq}")
+            else:
+                st.info("Este usuário ainda não enviou documentos.")
+        else:
+            st.warning("Cadastre profissionais primeiro.")
+
+    with tabs[3]: # Calendário Admin
+        st.subheader("Gerenciar Avisos (Futuro)")
+        st.info("Funcionalidade de editar calendário será implementada na próxima versão.")
+
+def screen_user_dashboard(user):
+    st.markdown(f"<h1 class='main-header'>Portal do Colaborador</h1>", unsafe_allow_html=True)
+    
+    # Sidebar Info
+    st.sidebar.markdown(f"### 👤 {user['Nome']}")
+    st.sidebar.text(f"Unidade: {user.get('Unidade', '-')}")
+    if st.sidebar.button("Sair"):
         st.session_state['user'] = None
-        st.session_state['role'] = None
         st.rerun()
 
-st.sidebar.markdown("---")
+    tabs = st.tabs(["📌 Mural & Calendário", "📂 Meus Documentos", "📝 Meus Dados"])
 
-# Menu de Navegação
-if st.session_state['role'] == 'admin':
-    menu = st.sidebar.radio("Menu Administrativo", ["Painel Admin", "Enviar Relatórios", "Ver Envios dos Usuários", "Mural de Avisos"])
-elif st.session_state['role'] == 'user':
-    menu = st.sidebar.radio("Menu do Colaborador", ["Meu Painel", "Meus Documentos", "Editar Meus Dados", "Mural de Avisos", "Calendário"])
-else:
-    menu = st.sidebar.radio("Menu Visitante", ["Mural de Avisos", "Calendário", "Criar Conta"])
-
-# --- LÓGICA DAS PÁGINAS ---
-
-# 1. MURAL
-if menu == "Mural de Avisos":
-    st.title("📌 Mural de Comunicação")
-    col1, col2, col3 = st.columns(3)
-    col1.error("🚨 Recesso: 22/Dez a 04/Jan"); col2.warning("🎉 Festa: 12/Dez"); col3.info("🩺 Reunião: 06/12")
-    st.markdown("---")
-    st.write("Bem-vindo ao portal. Faça login para acessar seus documentos.")
-
-# 2. CALENDÁRIO
-elif menu == "Calendário":
-    st.title("📅 Calendário 2025/26")
-    data_calendario = [
-        {"Data": "06/12/2025", "Evento": "Reunião Corpo Clínico", "Tipo": "Reunião"},
-        {"Data": "12/12/2025", "Evento": "Confraternização", "Tipo": "Festa"},
-        {"Data": "22/12/2025", "Evento": "Início Recesso", "Tipo": "Recesso"},
-        {"Data": "05/01/2026", "Evento": "Retorno", "Tipo": "Operacional"},
-    ]
-    st.dataframe(pd.DataFrame(data_calendario), use_container_width=True)
-
-# 3. CRIAR CONTA
-elif menu == "Criar Conta" or (st.session_state.get('menu_option') == 'cadastro_novo' and st.session_state['role'] is None):
-    st.title("📝 Novo Cadastro")
-    with st.form("form_cadastro_novo"):
-        st.write("Dados de Acesso")
-        cpf = st.text_input("CPF (Apenas números)", max_chars=11)
-        senha = st.text_input("Crie uma Senha", type="password")
+    with tabs[0]:
+        c1, c2, c3 = st.columns(3)
+        c1.warning("🎉 Confraternização: 12/Dez")
+        c2.error("🚨 Recesso: 22/Dez a 04/Jan")
+        c3.info("📅 Reunião: 06/12 - Sábado")
         
-        st.write("Dados Pessoais")
-        nome = st.text_input("Nome Completo")
-        email = st.text_input("E-mail")
-        telefone = st.text_input("Telefone")
-        unidade = st.selectbox("Unidade", ["Unidade - São Mateus", "Unidade - Passos"])
+        st.markdown("### Calendário Operacional")
+        data_cal = [
+            {"Data": "06/12/2025", "Evento": "Reunião Geral", "Tipo": "Obrigatório"},
+            {"Data": "22/12/2025", "Evento": "Início Recesso", "Tipo": "Feriado"},
+            {"Data": "05/01/2026", "Evento": "Retorno Atividades", "Tipo": "Normal"}
+        ]
+        st.dataframe(pd.DataFrame(data_cal), use_container_width=True)
+
+    with tabs[1]:
+        inbox, outbox = ensure_user_dirs(user['CPF'])
         
-        chave_pix = st.text_input("Chave PIX")
-        banco_pix = st.text_input("Banco")
+        col_in, col_out = st.columns(2)
         
-        if st.form_submit_button("Criar Conta"):
-            if not cpf or not senha or not nome:
-                st.error("CPF, Senha e Nome são obrigatórios.")
+        with col_in:
+            st.markdown("<div class='card'><h3>📥 Recebidos da Clínica</h3>", unsafe_allow_html=True)
+            files_in = get_files(inbox)
+            if files_in:
+                for f in files_in:
+                    with open(os.path.join(inbox, f), "rb") as doc:
+                        st.download_button(f"📄 Baixar {f}", doc, file_name=f, key=f"dl_{f}")
             else:
-                df = load_data_secure()
-                if not df.empty and cpf in df['CPF'].values:
-                    st.error("CPF já cadastrado.")
-                else:
-                    novo_usuario = {
-                        "CPF": cpf,
-                        "Senha": hash_password(senha),
-                        "Nome": nome,
-                        "Email": email,
-                        "Telefone": telefone,
-                        "Unidade": unidade,
-                        "Pix": chave_pix,
-                        "Banco": banco_pix,
-                        "Data Cadastro": datetime.now().strftime("%Y-%m-%d")
-                    }
-                    save_professional_secure(novo_usuario)
-                    ensure_directories(cpf)
-                    st.success("Conta criada! Faça login na barra lateral.")
+                st.info("Nenhum documento novo.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+        with col_out:
+            st.markdown("<div class='card'><h3>📤 Enviar Documento</h3>", unsafe_allow_html=True)
+            st.caption("Envie certificados, comprovantes ou fotos.")
+            uploaded = st.file_uploader("Selecionar Arquivo", key="uploader_user")
+            
+            if uploaded:
+                if st.button("Confirmar Envio"):
+                    if save_uploaded_file(uploaded, outbox):
+                        st.success("Enviado com sucesso!")
+                        # Gambiarra para limpar o uploader: rerun
+                        st.rerun()
+            
+            st.markdown("#### Histórico de Envios")
+            files_out = get_files(outbox)
+            for f in files_out:
+                st.text(f"✅ {f}")
+            st.markdown("</div>", unsafe_allow_html=True)
 
-# --- ÁREA DO USUÁRIO ---
+    with tabs[2]:
+        st.subheader("Atualização Cadastral")
+        with st.form("user_update"):
+            c1, c2 = st.columns(2)
+            email = c1.text_input("E-mail", value=user.get('Email', ''))
+            tel = c2.text_input("Telefone", value=user.get('Telefone', ''))
+            pix = c1.text_input("Chave PIX", value=user.get('Pix', ''))
+            banco = c2.text_input("Banco", value=user.get('Banco', ''))
+            disp = st.text_area("Disponibilidade", value=user.get('Disponibilidade', ''))
+            
+            if st.form_submit_button("Salvar Alterações"):
+                user_updated = user.copy()
+                user_updated.update({
+                    "Email": email, "Telefone": tel, 
+                    "Pix": pix, "Banco": banco, "Disponibilidade": disp
+                })
+                save_user(user_updated, update=True)
+                st.session_state['user'] = user_updated
+                st.success("Dados atualizados com sucesso!")
 
-elif menu == "Meu Painel" and st.session_state['role'] == 'user':
-    user = st.session_state['user']
-    st.title(f"👋 Olá, {user['Nome']}")
-    st.info(f"Unidade: {user.get('Unidade', 'N/A')} | CPF: {user['CPF']}")
-    
-    path_recebidos, _ = ensure_directories(user['CPF'])
-    qtd_relatorios = len(list_files_in_dir(path_recebidos))
-    st.metric("Relatórios Disponíveis", f"{qtd_relatorios}")
+# --- ORQUESTRADOR PRINCIPAL ---
 
-elif menu == "Meus Documentos" and st.session_state['role'] == 'user':
-    user = st.session_state['user']
-    path_recebidos, path_enviados = ensure_directories(user['CPF'])
+def main():
+    init_environment()
     
-    st.title("📂 Gestão de Documentos")
-    tab1, tab2 = st.tabs(["📥 Recebidos", "📤 Meus Envios"])
-    
-    with tab1:
-        arquivos = list_files_in_dir(path_recebidos)
-        if arquivos:
-            for arq in arquivos:
-                c1, c2 = st.columns([3, 1])
-                c1.text(f"📄 {arq}")
-                with open(os.path.join(path_recebidos, arq), "rb") as f:
-                    c2.download_button("Baixar", f, file_name=arq)
-                st.divider()
+    # Verifica se existe algum usuário no DB. Se vazio, vai para Setup.
+    df = load_db()
+    if df.empty:
+        screen_setup_admin()
+        return
+
+    # Verifica sessão
+    if 'user' not in st.session_state or st.session_state['user'] is None:
+        screen_login()
+    else:
+        user = st.session_state['user']
+        # Roteamento baseado na Role
+        if user.get('Role') == 'admin':
+            screen_admin_dashboard(user)
         else:
-            st.info("Nenhum documento recebido.")
+            screen_user_dashboard(user)
 
-    with tab2:
-        uploaded = st.file_uploader("Enviar arquivo para Gestão", type=['pdf', 'jpg', 'png', 'docx'])
-        if uploaded and st.button("Confirmar Envio"):
-            if save_uploaded_file(uploaded, path_enviados):
-                st.success("Enviado com sucesso!")
-                st.rerun()
-
-elif menu == "Editar Meus Dados" and st.session_state['role'] == 'user':
-    st.title("📝 Editar Perfil")
-    user = st.session_state['user']
-    with st.form("edit_profile"):
-        col_e1, col_e2 = st.columns(2)
-        email = col_e1.text_input("E-mail", value=user.get('Email', ''))
-        tel = col_e2.text_input("Telefone", value=user.get('Telefone', ''))
-        pix = col_e1.text_input("Chave PIX", value=user.get('Pix', ''))
-        banco = col_e2.text_input("Banco", value=user.get('Banco', ''))
-        
-        if st.form_submit_button("Atualizar"):
-            user_updated = user.copy()
-            user_updated.update({"Email": email, "Telefone": tel, "Pix": pix, "Banco": banco})
-            save_professional_secure(user_updated, is_update=True)
-            st.session_state['user'] = user_updated
-            st.success("Atualizado!")
-
-# --- ÁREA DO ADMIN ---
-
-elif menu == "Painel Admin" and st.session_state['role'] == 'admin':
-    st.title("🔒 Gestão Geral")
-    df = load_data_secure()
-    st.dataframe(df)
-
-elif menu == "Enviar Relatórios" and st.session_state['role'] == 'admin':
-    st.title("📤 Enviar Relatório Individual")
-    df = load_data_secure()
-    if not df.empty:
-        options = df.apply(lambda x: f"{x['Nome']} | CPF: {x['CPF']}", axis=1)
-        selected = st.selectbox("Selecione o Profissional", options)
-        if selected:
-            cpf_target = selected.split("CPF: ")[1]
-            path_target, _ = ensure_directories(cpf_target)
-            uploaded_report = st.file_uploader("Upload (PDF/Excel)", type=['pdf', 'xlsx', 'csv'])
-            if uploaded_report and st.button("Enviar"):
-                save_uploaded_file(uploaded_report, path_target)
-                st.success("Enviado!")
-
-elif menu == "Ver Envios dos Usuários" and st.session_state['role'] == 'admin':
-    st.title("📥 Arquivos dos Usuários")
-    df = load_data_secure()
-    if not df.empty:
-        selected = st.selectbox("Filtrar Profissional", df.apply(lambda x: f"{x['Nome']} | CPF: {x['CPF']}", axis=1))
-        if selected:
-            cpf_target = selected.split("CPF: ")[1]
-            _, path_user = ensure_directories(cpf_target)
-            arquivos = list_files_in_dir(path_user)
-            if arquivos:
-                for arq in arquivos:
-                    with open(os.path.join(path_user, arq), "rb") as f:
-                        st.download_button(f"⬇️ {arq}", f, file_name=f"USER_{cpf_target}_{arq}")
-            else:
-                st.info("Vazio.")
-
+if __name__ == "__main__":
+    main()
