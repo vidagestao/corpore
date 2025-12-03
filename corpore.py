@@ -10,7 +10,7 @@ import re
 # --- Configuração da Página (Deve ser a primeira linha) ---
 st.set_page_config(
     page_title="Portal Corpore",
-    page_icon="🏥",
+    page_icon="📈​",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -18,9 +18,15 @@ st.set_page_config(
 # --- CONFIGURAÇÕES GLOBAIS ---
 FILE_DB = 'profissionais_db_secure.csv'
 BASE_FILES_DIR = "corpore_docs"
-SENSITIVE_COLUMNS = ['CPF', 'Mãe', 'Email', 'Telefone', 'Pix', 'Banco', 'Notificacao', 'Resumo']
-# Adicionadas colunas 'Notificacao' e 'Resumo'
-ALL_COLUMNS = ['CPF', 'Senha', 'Nome', 'Role', 'Unidade', 'Email', 'Telefone', 'Pix', 'Banco', 'Disponibilidade', 'Data Cadastro', 'Notificacao', 'Resumo']
+
+# CPF removido. Telefone agora é a chave principal.
+SENSITIVE_COLUMNS = ['Mãe', 'Email', 'Pix', 'Banco', 'Notificacao', 'Resumo'] 
+# Telefone não é criptografado aqui para servir de chave de busca rápida (Login), 
+# mas em produção idealmente seria hash para busca e criptografado para display.
+# Para manter compatibilidade com o código anterior, manteremos Telefone visível no CSV mas seguro no app.
+
+ALL_COLUMNS = ['Telefone', 'Senha', 'Nome', 'Role', 'Unidade', 'Email', 'Pix', 'Banco', 'Disponibilidade', 'Data Cadastro', 'Notificacao', 'Resumo']
+UNIDADES_OPCOES = ["Corpore - São Mateus", "Corpore - Passos"]
 
 # CSS Personalizado para visual profissional
 st.markdown("""
@@ -40,7 +46,7 @@ st.markdown("""
 # --- FUNÇÕES CORE (Segurança, Arquivos, DB, Utils) ---
 
 def clean_phone_number(phone):
-    """Remove caracteres não numéricos para links do WhatsApp."""
+    """Remove caracteres não numéricos."""
     if not phone: return ""
     return re.sub(r'\D', '', str(phone))
 
@@ -49,15 +55,36 @@ def init_environment():
     if not os.path.exists(BASE_FILES_DIR):
         os.makedirs(BASE_FILES_DIR)
 
-def ensure_user_dirs(cpf):
-    """Cria pastas isoladas para cada usuário."""
-    user_root = os.path.join(BASE_FILES_DIR, str(cpf))
+def ensure_user_dirs(identifier):
+    """Cria pastas isoladas para cada usuário usando o Telefone como ID."""
+    clean_id = clean_phone_number(identifier)
+    user_root = os.path.join(BASE_FILES_DIR, clean_id)
     inbox = os.path.join(user_root, "recebidos_gestao") 
     outbox = os.path.join(user_root, "enviados_usuario") 
     
     os.makedirs(inbox, exist_ok=True)
     os.makedirs(outbox, exist_ok=True)
     return inbox, outbox
+
+def rename_user_dir(old_phone, new_phone):
+    """Renomeia a pasta de arquivos se o telefone mudar."""
+    old_id = clean_phone_number(old_phone)
+    new_id = clean_phone_number(new_phone)
+    
+    old_path = os.path.join(BASE_FILES_DIR, old_id)
+    new_path = os.path.join(BASE_FILES_DIR, new_id)
+    
+    if os.path.exists(old_path):
+        os.rename(old_path, new_path)
+    else:
+        ensure_user_dirs(new_phone)
+
+def delete_user_dir(phone):
+    """Apaga a pasta de arquivos do usuário."""
+    clean_id = clean_phone_number(phone)
+    path = os.path.join(BASE_FILES_DIR, clean_id)
+    if os.path.exists(path):
+        shutil.rmtree(path)
 
 def save_uploaded_file(uploaded_file, target_folder):
     try:
@@ -97,10 +124,14 @@ def load_db():
     if os.path.exists(FILE_DB):
         df = pd.read_csv(FILE_DB, dtype=str)
         
-        # Garante colunas novas
+        # Garante colunas novas e remove antigas se existirem (ex: CPF legado)
         for col in ALL_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
+        
+        # Limpa colunas que não usamos mais (CPF) para não dar erro
+        cols_to_keep = [c for c in df.columns if c in ALL_COLUMNS]
+        df = df[cols_to_keep]
 
         # Desofusca
         for col in SENSITIVE_COLUMNS:
@@ -109,66 +140,86 @@ def load_db():
         return df
     return pd.DataFrame(columns=ALL_COLUMNS)
 
-def save_user(user_data, update=False):
+def save_user(user_data, old_phone_key=None):
+    """
+    Salva ou atualiza usuário.
+    old_phone_key: Se fornecido, indica uma edição onde a chave (telefone) mudou.
+    """
     df = load_db()
     data_to_save = user_data.copy()
     
-    # Criptografa
+    # Criptografa campos sensíveis
     for col in SENSITIVE_COLUMNS:
         if col in data_to_save:
             data_to_save[col] = encrypt(data_to_save[col])
             
+    # Hash de senha se não for hash
     if 'Senha' in data_to_save and len(data_to_save['Senha']) < 50:
         data_to_save['Senha'] = hash_pass(data_to_save['Senha'])
 
     df_new_row = pd.DataFrame([data_to_save])
+    
+    # Normaliza colunas
     for col in ALL_COLUMNS:
         if col not in df_new_row.columns:
             df_new_row[col] = ""
 
-    if update:
-        df = df[df['CPF'] != user_data['CPF']]
-        # Re-criptografa DF existente
-        for col in SENSITIVE_COLUMNS:
-            if col in df.columns:
-                df[col] = df[col].apply(encrypt)
-        df_final = pd.concat([df, df_new_row], ignore_index=True)
-    else:
-        if os.path.exists(FILE_DB):
-            df_raw = pd.read_csv(FILE_DB, dtype=str)
-            df_final = pd.concat([df_raw, df_new_row], ignore_index=True)
-        else:
-            df_final = df_new_row
+    # Lógica de Atualização vs Inserção
+    # Se old_phone_key existe, estamos editando um registro existente
+    # Se não existe, verificamos se o telefone atual já está no banco (update in-place) ou é novo
+    
+    target_phone = old_phone_key if old_phone_key else user_data['Telefone']
+    
+    # Remove registro antigo se existir
+    df = df[df['Telefone'] != target_phone]
+    
+    # Re-criptografa DF da memória
+    for col in SENSITIVE_COLUMNS:
+        if col in df.columns:
+            df[col] = df[col].apply(encrypt)
             
+    # Adiciona o novo/atualizado
+    df_final = pd.concat([df, df_new_row], ignore_index=True)
     df_final.to_csv(FILE_DB, index=False)
 
+def delete_user(phone):
+    """Remove usuário do banco e arquivos."""
+    df = load_db()
+    df = df[df['Telefone'] != phone]
+    
+    # Re-criptografa para salvar
+    for col in SENSITIVE_COLUMNS:
+        if col in df.columns:
+            df[col] = df[col].apply(encrypt)
+            
+    df.to_csv(FILE_DB, index=False)
+    delete_user_dir(phone)
+
 def send_notification_to_all(message):
-    """Envia notificação para todos os usuários (exceto admins)."""
     df = load_db()
     users = df[df['Role'] != 'admin']
-    
     count = 0
     for index, row in users.iterrows():
         user_data = row.to_dict()
         user_data['Notificacao'] = message
-        save_user(user_data, update=True)
+        save_user(user_data)
         count += 1
     return count
 
-def send_notification_individual(cpf, message):
+def send_notification_individual(phone, message):
     df = load_db()
-    user = df[df['CPF'] == cpf]
+    user = df[df['Telefone'] == phone]
     if not user.empty:
         user_data = user.iloc[0].to_dict()
         user_data['Notificacao'] = message
-        save_user(user_data, update=True)
+        save_user(user_data)
         return True
     return False
 
 def clear_notification(user_data):
     user_data['Notificacao'] = ""
-    save_user(user_data, update=True)
-    st.session_state['user'] = user_data # Atualiza sessão
+    save_user(user_data)
+    st.session_state['user'] = user_data
 
 # --- INTERFACE: TELAS ---
 
@@ -180,21 +231,20 @@ def screen_setup_admin():
         col1, col2 = st.columns(2)
         nome = col1.text_input("Nome do Gestor")
         telefone = col1.text_input("Celular (Login)", placeholder="Ex: 11999998888")
-        cpf = col2.text_input("CPF (Para registro)", max_chars=11)
         senha = col2.text_input("Senha", type="password")
         
         if st.form_submit_button("Inicializar Sistema"):
-            if not telefone or not cpf or not nome or not senha:
+            if not telefone or not nome or not senha:
                 st.error("Preencha todos os campos.")
             else:
                 admin_data = {
-                    "Nome": nome, "CPF": cpf, "Senha": senha, 
+                    "Nome": nome, "Senha": senha, 
                     "Role": "admin", "Unidade": "Matriz",
                     "Data Cadastro": datetime.now().strftime("%Y-%m-%d"),
                     "Email": "", "Telefone": telefone, "Notificacao": "", "Resumo": ""
                 }
                 save_user(admin_data)
-                ensure_user_dirs(cpf)
+                ensure_user_dirs(telefone)
                 st.success("Administrador criado! Atualize a página.")
                 st.balloons()
 
@@ -213,11 +263,9 @@ def screen_login():
             
             if submitted:
                 df = load_db()
-                # Busca pelo Telefone em vez do CPF
                 user = df[df['Telefone'] == telefone_login]
                 
                 if not user.empty:
-                    # Pega o primeiro registro encontrado (caso haja duplicidade erro)
                     user_data = user.iloc[0].to_dict()
                     stored_pass = user_data['Senha']
                     
@@ -244,7 +292,7 @@ def screen_admin_dashboard(user):
     st.markdown(f"<h1 class='main-header'>Painel de Gestão</h1>", unsafe_allow_html=True)
     st.write(f"Logado como: **{user['Nome']}** (Administrador)")
     
-    tabs = st.tabs(["📊 Visão Geral", "📢 Comunicação & Avisos", "👥 Profissionais", "📤 Arquivos"])
+    tabs = st.tabs(["📊 Visão Geral", "📢 Comunicação & Avisos", "👥 Gestão de Profissionais", "📤 Arquivos"])
     
     df = load_db()
     
@@ -260,18 +308,17 @@ def screen_admin_dashboard(user):
 
     with tabs[1]: # Notificações
         st.subheader("Enviar Notificação (Pop-up)")
-        st.info("A mensagem aparecerá para o usuário na próxima vez que ele entrar ou atualizar a página.")
         
         with st.form("msg_form"):
             tipo_envio = st.radio("Destinatário", ["Todos os Usuários", "Individual"])
             texto_aviso = st.text_area("Mensagem do Aviso")
             
-            cpf_alvo = None
+            phone_alvo = None
             if tipo_envio == "Individual":
                 lista_users = df[df['Role'] != 'admin']
                 if not lista_users.empty:
-                    escolha = st.selectbox("Selecione:", lista_users['Nome'] + " - " + lista_users['CPF'])
-                    cpf_alvo = escolha.split(" - ")[-1]
+                    escolha = st.selectbox("Selecione:", lista_users['Nome'] + " - " + lista_users['Telefone'])
+                    phone_alvo = escolha.split(" - ")[-1]
             
             if st.form_submit_button("Enviar Aviso"):
                 if not texto_aviso:
@@ -281,74 +328,108 @@ def screen_admin_dashboard(user):
                         qtd = send_notification_to_all(texto_aviso)
                         st.success(f"Mensagem enviada para {qtd} usuários!")
                     else:
-                        if send_notification_individual(cpf_alvo, texto_aviso):
+                        if send_notification_individual(phone_alvo, texto_aviso):
                             st.success("Mensagem enviada para o usuário!")
 
-    with tabs[2]: # Gestão
+    with tabs[2]: # Gestão (CRUD)
         c1, c2 = st.columns([1, 2])
         
         with c1:
-            st.markdown("### ➕ Cadastrar")
+            st.markdown("### ➕ Cadastrar Novo")
             with st.form("new_user"):
                 nome = st.text_input("Nome")
-                celular = st.text_input("Celular (Login)", help="Somente números")
-                cpf = st.text_input("CPF")
+                celular = st.text_input("Celular (Login)")
                 senha_temp = st.text_input("Senha Inicial")
-                unidade = st.selectbox("Unidade", ["Unidade 1 - Centro", "Unidade 2 - Zona Sul"])
+                unidade = st.selectbox("Unidade", UNIDADES_OPCOES)
                 
                 if st.form_submit_button("Criar Cadastro"):
-                    if not celular or not cpf:
-                        st.error("Celular e CPF obrigatórios.")
+                    if not celular or not nome:
+                        st.error("Celular e Nome obrigatórios.")
                     elif celular in df['Telefone'].values:
                         st.error("Celular já cadastrado.")
                     else:
                         new_data = {
-                            "Nome": nome, "CPF": cpf, "Telefone": celular, "Senha": senha_temp,
+                            "Nome": nome, "Telefone": celular, "Senha": senha_temp,
                             "Role": "user", "Unidade": unidade, "Data Cadastro": datetime.now().strftime("%Y-%m-%d"),
                             "Email": "", "Notificacao": "", "Resumo": ""
                         }
                         save_user(new_data)
-                        ensure_user_dirs(cpf)
+                        ensure_user_dirs(celular)
                         st.success("Cadastrado com sucesso!")
                         st.rerun()
         
         with c2:
-            st.markdown("### 📋 Lista Completa")
-            # Exibição personalizada com botão de WhatsApp e Resumo
-            for idx, row in df[df['Role'] != 'admin'].iterrows():
-                with st.expander(f"👤 {row['Nome']} ({row['Unidade']})"):
-                    k1, k2 = st.columns([3, 1])
-                    with k1:
-                        st.write(f"**Celular:** {row['Telefone']}")
-                        st.write(f"**Email:** {row['Email']}")
-                        st.write(f"**Resumo Profissional:**")
-                        if row.get('Resumo'):
-                            st.info(row['Resumo'])
-                        else:
-                            st.caption("Nenhum resumo preenchido pelo profissional.")
-                    
-                    with k2:
-                        phone_clean = clean_phone_number(row['Telefone'])
-                        if phone_clean:
-                            link_wa = f"https://wa.me/55{phone_clean}"
-                            st.markdown(f"""
-                                <a href="{link_wa}" target="_blank" class="whatsapp-btn">
-                                💬 Chamar no WhatsApp
-                                </a>
-                            """, unsafe_allow_html=True)
-                        else:
-                            st.caption("Sem telefone válido")
+            st.markdown("### 📋 Editar / Excluir")
+            # Lista iterável com botões de ação
+            users_df = df[df['Role'] != 'admin']
+            
+            if users_df.empty:
+                st.info("Nenhum profissional cadastrado.")
+            else:
+                for idx, row in users_df.iterrows():
+                    with st.expander(f"{row['Nome']} | {row['Unidade']}"):
+                        # Form de Edição
+                        with st.form(f"edit_{idx}"):
+                            st.write("📝 **Editar Dados**")
+                            col_e1, col_e2 = st.columns(2)
+                            e_nome = col_e1.text_input("Nome", value=row['Nome'])
+                            e_tel = col_e2.text_input("Celular (Login)", value=row['Telefone'])
+                            e_unit = st.selectbox("Unidade", UNIDADES_OPCOES, index=UNIDADES_OPCOES.index(row['Unidade']) if row['Unidade'] in UNIDADES_OPCOES else 0)
+                            e_pass = st.text_input("Nova Senha (deixe em branco para manter)", type="password")
+                            
+                            c_save, c_del = st.columns([3, 1])
+                            
+                            saved = c_save.form_submit_button("💾 Salvar Alterações")
+                            
+                            if saved:
+                                user_updated = row.to_dict()
+                                user_updated['Nome'] = e_nome
+                                user_updated['Telefone'] = e_tel
+                                user_updated['Unidade'] = e_unit
+                                if e_pass:
+                                    user_updated['Senha'] = e_pass
+                                
+                                # Verifica se mudou o telefone para renomear pasta e atualizar chave
+                                old_phone = row['Telefone']
+                                if e_tel != old_phone:
+                                    rename_user_dir(old_phone, e_tel)
+                                    save_user(user_updated, old_phone_key=old_phone)
+                                else:
+                                    save_user(user_updated, old_phone_key=old_phone) # Update normal
+                                    
+                                st.success("Atualizado!")
+                                st.rerun()
+
+                        # Botão Excluir (Fora do form para evitar submit acidental)
+                        col_del_1, col_del_2 = st.columns([3,1])
+                        with col_del_2:
+                            if st.button("🗑️ Excluir Conta", key=f"del_{idx}"):
+                                delete_user(row['Telefone'])
+                                st.warning(f"Usuário {row['Nome']} excluído.")
+                                st.rerun()
+                        
+                        # Resumo e WhatsApp
+                        st.markdown("---")
+                        k1, k2 = st.columns([3, 1])
+                        with k1:
+                            st.caption(f"Resumo: {row.get('Resumo', 'Não preenchido')}")
+                        with k2:
+                            phone_clean = clean_phone_number(row['Telefone'])
+                            if phone_clean:
+                                link_wa = f"https://wa.me/55{phone_clean}"
+                                st.markdown(f'<a href="{link_wa}" target="_blank" class="whatsapp-btn">💬 WhatsApp</a>', unsafe_allow_html=True)
+
 
     with tabs[3]: # Arquivos
         st.subheader("Enviar Arquivos Individuais")
         users_list = df[df['Role'] != 'admin']
         if not users_list.empty:
-            destinatario = st.selectbox("Para quem?", users_list['Nome'] + " - " + users_list['CPF'])
-            cpf_dest = destinatario.split(" - ")[-1]
+            destinatario = st.selectbox("Para quem?", users_list['Nome'] + " - " + users_list['Telefone'])
+            phone_dest = destinatario.split(" - ")[-1]
             file = st.file_uploader("Arquivo", type=['pdf', 'xlsx', 'jpg', 'png'])
             
             if file and st.button("Enviar"):
-                path_dest, _ = ensure_user_dirs(cpf_dest)
+                path_dest, _ = ensure_user_dirs(phone_dest)
                 if save_uploaded_file(file, path_dest):
                     st.success("Enviado!")
 
@@ -411,7 +492,7 @@ def screen_user_dashboard(user):
             st.info("Em caso de emergência administrativa durante o recesso, utilize o botão de WhatsApp na barra lateral.")
 
     with tabs[1]:
-        inbox, outbox = ensure_user_dirs(user['CPF'])
+        inbox, outbox = ensure_user_dirs(user['Telefone'])
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### 📥 Recebidos")
@@ -436,7 +517,7 @@ def screen_user_dashboard(user):
         with st.form("resumo_form"):
             novo_resumo = st.text_area("Descrição Técnica / Público Alvo", value=user.get('Resumo', ''), height=200)
             
-            # Campos de contato também
+            # Campos de contato
             c_email = st.text_input("E-mail Atual", value=user.get('Email', ''))
             c_pix = st.text_input("Chave PIX", value=user.get('Pix', ''))
             
@@ -445,7 +526,7 @@ def screen_user_dashboard(user):
                 user_updated.update({
                     "Resumo": novo_resumo, "Email": c_email, "Pix": c_pix
                 })
-                save_user(user_updated, update=True)
+                save_user(user_updated, old_phone_key=user['Telefone'])
                 st.session_state['user'] = user_updated
                 st.success("Perfil atualizado com sucesso!")
 
