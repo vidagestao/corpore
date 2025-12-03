@@ -18,6 +18,8 @@ st.set_page_config(
 FILE_DB = 'profissionais_db_secure.csv'
 BASE_FILES_DIR = "corpore_docs"
 SENSITIVE_COLUMNS = ['CPF', 'Mãe', 'Email', 'Telefone', 'Pix', 'Banco']
+# Define todas as colunas esperadas para garantir integridade do DB
+ALL_COLUMNS = ['CPF', 'Senha', 'Nome', 'Role', 'Unidade', 'Email', 'Telefone', 'Pix', 'Banco', 'Disponibilidade', 'Data Cadastro']
 
 # CSS Personalizado para visual profissional
 st.markdown("""
@@ -88,12 +90,19 @@ def verify_pass(stored, provided):
 def load_db():
     if os.path.exists(FILE_DB):
         df = pd.read_csv(FILE_DB, dtype=str) # Lê tudo como string para evitar erros de CPF
+        
+        # Garante que todas as colunas esperadas existam, mesmo que vazias
+        # Isso corrige o erro KeyError se o CSV foi criado incompleto
+        for col in ALL_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+
         # Desofusca para uso na memória
         for col in SENSITIVE_COLUMNS:
             if col in df.columns:
                 df[col] = df[col].apply(lambda x: decrypt(x))
         return df
-    return pd.DataFrame(columns=['CPF', 'Senha', 'Nome', 'Role', 'Unidade', 'Email', 'Telefone', 'Pix', 'Banco', 'Disponibilidade'])
+    return pd.DataFrame(columns=ALL_COLUMNS)
 
 def save_user(user_data, update=False):
     """Salva ou atualiza um usuário."""
@@ -110,10 +119,14 @@ def save_user(user_data, update=False):
         data_to_save['Senha'] = hash_pass(data_to_save['Senha'])
 
     df_new_row = pd.DataFrame([data_to_save])
+    
+    # Garante que o novo dataframe tenha todas as colunas para evitar fragmentação
+    for col in ALL_COLUMNS:
+        if col not in df_new_row.columns:
+            df_new_row[col] = ""
 
     if update:
         # Remove antigo e adiciona novo (pelo CPF que é a chave)
-        # Nota: CPF criptografado muda, então buscamos pelo CPF decriptado antes
         df = df[df['CPF'] != user_data['CPF']] # Remove user atual da memória decriptada
         
         # Re-criptografa todo o DF da memória para salvar
@@ -155,7 +168,8 @@ def screen_setup_admin():
                 admin_data = {
                     "Nome": nome, "CPF": cpf, "Senha": senha, 
                     "Role": "admin", "Unidade": "Matriz",
-                    "Data Cadastro": datetime.now().strftime("%Y-%m-%d")
+                    "Data Cadastro": datetime.now().strftime("%Y-%m-%d"),
+                    "Email": "", "Telefone": "" # Inicializa vazio para evitar erro
                 }
                 save_user(admin_data)
                 ensure_user_dirs(cpf)
@@ -252,7 +266,8 @@ def screen_admin_dashboard(user):
                         new_data = {
                             "Nome": new_nome, "CPF": new_cpf, "Senha": new_pass,
                             "Role": "user", "Unidade": new_unit,
-                            "Data Cadastro": datetime.now().strftime("%Y-%m-%d")
+                            "Data Cadastro": datetime.now().strftime("%Y-%m-%d"),
+                            "Email": "", "Telefone": "" # Inicializa campos vazios
                         }
                         save_user(new_data)
                         ensure_user_dirs(new_cpf)
@@ -263,7 +278,12 @@ def screen_admin_dashboard(user):
             st.markdown("### 📋 Lista de Profissionais")
             # Mostra tabela simplificada
             display_cols = ['Nome', 'CPF', 'Unidade', 'Telefone', 'Email']
-            st.dataframe(df[display_cols], use_container_width=True)
+            
+            # Garante que as colunas existam no DF antes de exibir
+            # (Redundância de segurança para evitar erro de display)
+            valid_cols = [c for c in display_cols if c in df.columns]
+            
+            st.dataframe(df[valid_cols], use_container_width=True)
 
     with tabs[2]: # Arquivos
         st.subheader("Envio de Relatórios e Holerites")
