@@ -214,7 +214,7 @@ elif menu == "Criar Conta" or (st.session_state.get('menu_option') == 'cadastro_
         nome = st.text_input("Nome Completo")
         email = st.text_input("E-mail")
         telefone = st.text_input("Telefone")
-        unidade = st.selectbox("Unidade", ["Unidade 1 - Centro", "Unidade 2 - Zona Sul"])
+        unidade = st.selectbox("Unidade", ["Unidade - São Mateus", "Unidade - Passos"])
         
         chave_pix = st.text_input("Chave PIX")
         banco_pix = st.text_input("Banco")
@@ -332,3 +332,4 @@ elif menu == "Ver Envios dos Usuários" and st.session_state['role'] == 'admin':
                         st.download_button(f"⬇️ {arq}", f, file_name=f"USER_{cpf_target}_{arq}")
             else:
                 st.info("Vazio.")
+
