@@ -190,6 +190,32 @@ def screen_login():
                 else:
                     st.error("Usuário não encontrado.")
 
+        # --- BOTÃO DE EMERGÊNCIA/RESET ---
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander("🆘 Opções de Recuperação (Reset Total)"):
+            st.warning("⚠️ CUIDADO: Esta ação apagará TODOS os usuários e arquivos do sistema.")
+            st.write("Utilize apenas se perdeu o acesso ao Admin Master e precisa reconfigurar do zero.")
+            confirm_code = st.text_input("Digite 'RESETAR' para confirmar a exclusão:")
+            
+            if st.button("🗑️ DELETAR BASE E REINICIAR", type="primary"):
+                if confirm_code == "RESETAR":
+                    try:
+                        # Deleta o arquivo CSV do banco de dados
+                        if os.path.exists(FILE_DB):
+                            os.remove(FILE_DB)
+                        
+                        # Deleta a pasta de arquivos (opcional, para limpar tudo mesmo)
+                        if os.path.exists(BASE_FILES_DIR):
+                            shutil.rmtree(BASE_FILES_DIR)
+                            
+                        st.session_state.clear()
+                        st.success("Sistema resetado com sucesso! Recarregando...")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao resetar: {e}")
+                else:
+                    st.error("Código de confirmação incorreto.")
+
 def screen_admin_dashboard(user):
     st.markdown(f"<h1 class='main-header'>Painel de Gestão</h1>", unsafe_allow_html=True)
     st.write(f"Logado como: **{user['Nome']}** (Administrador)")
